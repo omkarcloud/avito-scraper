@@ -30,3 +30,8 @@ AVITO_PROXY = os.environ.get("AVITO_PROXY") or None
 def avito_proxy():
     """The proxy for one session (None = direct)."""
     return os.environ.get("AVITO_PROXY") or None
+
+
+# ---- added by the sync: defaults for a direct run ----
+AVITO_SESSION_MAX_AGE = 600
+AVITO_SESSION_USES = 40

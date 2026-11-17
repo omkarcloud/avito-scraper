@@ -1,8 +1,14 @@
 """Avito (www.avito.ru) transport: plain curl_cffi with browser-impersonated
-TLS, no browser. Egress: one sticky exit per thread session
-(config.avito_proxy(), knob AVITO_EXIT — a Russian residential exit, see
-the probe table in config.py); a retryable failure drops the session, so
-the retry rides a fresh exit and solves a fresh challenge.
+TLS, no browser. Egress: one sticky exit per session (config.avito_proxy(),
+knob AVITO_EXIT — a Russian residential exit, see the probe table in
+config.py). Sessions live in a process-wide identity_pool.Pool in exclusive
+mode (since 2026-11-09): a request borrows one for ONE call and hands it
+back, so the next request on any of the pod's 64 threads reuses its
+proof-of-work clearance instead of solving its own (before, each thread
+kept a session and solved the PoW per thread). A retryable failure marks the
+session dead (retired on give-back), so the retry rides a fresh exit and
+solves a fresh challenge; a session is also retired after AVITO_SESSION_USES
+calls or AVITO_SESSION_MAX_AGE seconds (the clearance's unblock_ttl).
 
 The site's firewall (research + build 2026-10-23/24):
 
@@ -62,11 +68,10 @@ Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
 """
 import base64
 import hashlib
-import json
+import fastjson
 import os
 import re
 import sys
-import threading
 import time
 from urllib.parse import urlencode, urlparse
 
@@ -76,8 +81,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 import egress
+import identity_pool
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
 from avito import refs
+from scraper_utils import retry
 
 HOST = refs.SITE
 IMPERSONATE = "chrome"
@@ -123,57 +130,74 @@ class AvitoNotFound(NotFound):
     """Ad / seller / location does not exist — never retried."""
 
 
-# One session per cheroot worker thread: a curl handle must not be shared
-# across threads. The session KEEPS its cookie jar: the proof-of-work
-# clearance lives there.
-_local = threading.local()
+# ---- pooled sessions ---------------------------------------------------------------------
+# One pool, one key: page and JSON calls share a session (the proof-of-work
+# clearance in its jar covers both). A session owns ONE curl handle, so the
+# pool lends it to one request at a time; threads take turns on it.
 
+class _Session(identity_pool.Identity):
+    """One curl session on one sticky exit; the PoW clearance lives in its
+    jar. The pool (identity_pool.Identity) keeps budget / age / refusal."""
 
-def _session():
-    sess = getattr(_local, "session", None)
-    if sess is None:
+    def __init__(self, proxy):
         from curl_cffi import requests as curl_requests
-        proxy = config.avito_proxy()
-        sess = curl_requests.Session(impersonate=IMPERSONATE)
+        super().__init__(exit=proxy)
+        self.curl = curl_requests.Session(impersonate=IMPERSONATE, use_thread_local_curl=False)
         if proxy:
-            sess.proxies = {"http": proxy, "https": proxy}
+            self.curl.proxies = {"http": proxy, "https": proxy}
         # owner rule 2026-10-24: the language matches the exit's country
-        sess.headers.update({"accept-language": egress.accept_language(proxy)})
-        _local.session = sess
-    return sess
+        self.curl.headers.update({"accept-language": egress.accept_language(proxy)})
+        self.closed = False
 
-
-def _drop_session():
-    """Close the thread's session so the retry rides a fresh exit."""
-    sess = getattr(_local, "session", None)
-    _local.session = None
-    if sess is not None:
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
         try:
-            sess.close()
+            self.curl.close()
         except Exception:
             pass
 
 
+def _mint(key, hint=None):
+    """The pool's mint: a cold session on a fresh exit (the first call meets
+    the 439 and clears it)."""
+    return _Session(config.avito_proxy())
+
+
+_sessions = identity_pool.Pool(
+    "avito", _mint, mode="exclusive",
+    budget=lambda: config.AVITO_SESSION_USES,
+    max_age=lambda: config.AVITO_SESSION_MAX_AGE,
+    on_retire=lambda ident, reason: ident.close())
+
+
+def _on_session(fn):
+    """fn(sess) on a borrowed session. A retryable failure (a block, a
+    transport error, a degraded answer) marks the session dead, so it is
+    retired on give-back and the retry rides a fresh exit."""
+    sess = _sessions.borrow()
+    try:
+        return fn(sess)
+    except AvitoUpstreamError:
+        sess.dead = True
+        raise
+    finally:
+        _sessions.give_back(sess)
+
+
 def _retrying(fn):
     """Run fn() under the shared retry policy (AvitoUpstreamError only;
-    NotFound / BadRequest surface immediately)."""
-    last = None
-    for attempt in range(1, config.MAX_RETRIES + 1):
-        try:
-            return fn()
-        except AvitoUpstreamError as e:
-            last = e
-            _drop_session()
-            if attempt < config.MAX_RETRIES:
-                time.sleep(config.RETRY_BACKOFF * attempt)
-    raise last
+    NotFound / BadRequest surface immediately). The failed call already
+    retired its session (_on_session)."""
+    return retry.run(fn, config, AvitoUpstreamError, None)
 
 
-def _cookie(sess, name):
+def _cookie(curl, name):
     """A cookie value by name (the jar may hold the same name for two
     domains; the newest wins)."""
     value = None
-    for cookie in sess.cookies.jar:
+    for cookie in curl.cookies.jar:
         if cookie.name == name:
             value = cookie.value
     return value
@@ -182,7 +206,7 @@ def _cookie(sess, name):
 def _jwt_payload(token):
     part = token.split(".")[1]
     part += "=" * (-len(part) % 4)
-    return json.loads(base64.urlsafe_b64decode(part))
+    return fastjson.loads(base64.urlsafe_b64decode(part))
 
 
 def solve_pow(challenge_id, complexity, max_complexity=None):
@@ -199,19 +223,19 @@ def solve_pow(challenge_id, complexity, max_complexity=None):
     return nonce
 
 
-def _clear_pow(sess, referer):
-    """Answer the 439 proof-of-work on this session (raises AvitoBlocked)."""
-    challenge = _cookie(sess, "pow_challenge")
+def _clear_pow(curl, referer):
+    """Answer the 439 proof-of-work on this curl session (raises AvitoBlocked)."""
+    challenge = _cookie(curl, "pow_challenge")
     if not challenge:
         raise AvitoBlocked("proof-of-work page without a pow_challenge cookie")
     headers = {"accept": "*/*", "origin": HOST, "referer": referer}
     try:
-        got = sess.post(HOST + "/web/3/firewallPow/get", json={"challenge": challenge},
+        got = curl.post(HOST + "/web/3/firewallPow/get", json={"challenge": challenge},
                         headers=headers, timeout=JSON_TIMEOUT).json()
         token = ((got.get("success") or {}).get("result") or {}).get("challenge_jwt")
         payload = _jwt_payload(token)
         nonce = solve_pow(payload["id"], int(payload["compl"]))
-        verified = sess.post(HOST + "/web/3/firewallPow/verify",
+        verified = curl.post(HOST + "/web/3/firewallPow/verify",
                              json={"challenge": token, "nonce": nonce},
                              headers=headers, timeout=JSON_TIMEOUT).json()
     except AvitoBlocked:
@@ -267,17 +291,16 @@ def _request(method, path, *, label, kind="json", query=None, body=None, referer
         headers["origin"] = HOST
     timeout = timeout or (PAGE_TIMEOUT if kind == "page" else JSON_TIMEOUT)
 
-    def send(sess):
-        return sess.request(method, url, json=body, headers=headers, timeout=timeout,
+    def send(curl):
+        return curl.request(method, url, json=body, headers=headers, timeout=timeout,
                             allow_redirects=True)
 
-    def once():
-        sess = _session()
+    def once(sess):
         try:
-            resp = send(sess)
+            resp = send(sess.curl)
             if resp.status_code == 439:
-                _clear_pow(sess, url)
-                resp = send(sess)
+                _clear_pow(sess.curl, url)      # a fresh session, or a clearance past its ttl
+                resp = send(sess.curl)
         except AvitoUpstreamError:
             raise
         except Exception as e:
@@ -287,7 +310,7 @@ def _request(method, path, *, label, kind="json", query=None, body=None, referer
             check(resp, label)
         return resp
 
-    return _retrying(once)
+    return _retrying(lambda: _on_session(once))
 
 
 def _expect(marker, what):

@@ -314,9 +314,17 @@ def _reviews_page(key, sort, with_photos_only, page):
     return parsers.parse_reviews(payload)
 
 
+def _reviews_has_next(parsed):
+    """A full page without nextPage still has a next page: the worst case
+    is one empty page after an exactly-full last one."""
+    reviews = parsed["reviews"]
+    return bool(reviews) and (parsed["next_offset"] is not None or len(reviews) >= REVIEWS_PAGE_SIZE)
+
+
 def _seller_reviews(seller, sort, with_photos_only, page):
     # The ratings API publishes no total for the list (the profile's review
-    # count covers starred reviews only): `has_next` follows its nextPage.
+    # count covers starred reviews only): `has_next` follows its nextPage,
+    # which it now and then leaves off a full page (_reviews_has_next).
     if seller["kind"] in ("key", "hash"):
         parsed = _reviews_page(seller["id"], sort, with_photos_only, page)
         known = bool(parsed["reviews"] or parsed["summary"]) or not _unknown_key(seller["id"])
@@ -328,7 +336,7 @@ def _seller_reviews(seller, sort, with_photos_only, page):
                 "sort": sort,
                 "results": parsed["reviews"],
                 "pagination": {"page": page, "items_per_page": REVIEWS_PAGE_SIZE,
-                               "has_next": parsed["next_offset"] is not None and bool(parsed["reviews"]),
+                               "has_next": _reviews_has_next(parsed),
                                "total_pages": None, "total_count": None},
             }
         if seller["kind"] == "key":
@@ -343,7 +351,7 @@ def _seller_reviews(seller, sort, with_photos_only, page):
         "sort": sort,
         "results": parsed["reviews"],
         "pagination": {"page": page, "items_per_page": REVIEWS_PAGE_SIZE,
-                       "has_next": parsed["next_offset"] is not None and bool(parsed["reviews"]),
+                       "has_next": _reviews_has_next(parsed),
                        "total_pages": None, "total_count": None},
     }
 

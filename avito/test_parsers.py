@@ -263,6 +263,26 @@ def test_search_card_discounted_price(bmw):
     card = next(c for c in bmw["results"] if c["id"] == 8368666040)
     assert card["price"]["amount"] == 9800000          # the shown price
     assert card["price"]["discounted_amount"] == 9550000
+    assert card["price"]["text"] == "9 800 000 ₽"
+
+
+def test_search_card_sale_price(bmw):
+    # saleIcon + discount step: the card shows the sale price, priceDetailed the pre-sale one
+    card = next(c for c in bmw["results"] if c["id"] == 4541657835)
+    assert card["price"]["amount"] == 4901
+    assert card["price"]["text"] == "4 901 ₽"
+    assert card["price"]["old_amount"] == 5270
+    assert card["price"]["discount_percent"] == 7
+    assert card["price"]["discounted_amount"] is None
+
+
+def test_search_card_dealer_from_price(bmw):
+    # "от 5 950 000 ₽" printed; value and stringWithoutDiscount are the undiscounted price
+    card = next(c for c in bmw["results"] if c["id"] == 8410314402)
+    assert card["price"]["amount"] == 6750000
+    assert card["price"]["text"] == "от 5 950 000 ₽"
+    assert card["price"]["discounted_amount"] == 5950000
+    assert card["price"]["old_amount"] is None
 
 
 def test_search_filters_and_facets(bmw):
@@ -401,6 +421,21 @@ def test_seller_shop(shop):
     assert shop["selections"][0]["title"] == "BMW в наличии"
     assert "sellerId=fb6e01314a92d1147c6e24f90ed2e18d" in shop["selections"][0]["link"]
     assert len(shop["images"]) == 54
+
+
+def test_seller_shop_ml_layout():
+    # premium shops: base_info_ml / ml_tabs_with_widgets instead of base_info / contacts
+    shop = P.parse_seller_page(fixture("seller_shop_ml.html"))
+    assert shop["id"] == "4afa0831691496ecd552e062456cfaa2"
+    assert shop["slug"] == "619925d45391185f2e387acad44fe3e9"
+    assert shop["on_avito_since"] == "2026-05"
+    assert shop["rating"]["score"] == 4.7 and shop["rating"]["reviews_count"] == 368
+    assert shop["rating"]["active_reviews_count"] == 459
+    assert shop["rating"]["distribution"]["1"] == 21
+    assert shop["subscribers_count"] == 738
+    assert "Данные подтверждены" in shop["badges"]
+    assert shop["contact"]["has_messenger"] is True and shop["contact"]["has_phone"] is False
+    assert shop["active_ads_count"] > 3000
 
 
 def test_seller_person_and_private_profile():
@@ -571,6 +606,11 @@ def test_seller_reviews_by_key(monkeypatch):
     out = api._seller_reviews({"kind": "key", "id": KEY}, "newest", None, 2)
     assert len(out["results"]) == 25 and out["pagination"]["has_next"] is True
     assert out["seller"]["id"] == KEY
+    # a full page the ratings API sent without nextPage still pages on
+    page2 = fixture("seller_reviews_page2.json")
+    page2.pop("nextPage", None)
+    monkeypatch.setattr(api.fetch, "fetch_seller_reviews", lambda *a, **k: page2)
+    assert api._seller_reviews({"kind": "key", "id": KEY}, "newest", None, 2)["pagination"]["has_next"] is True
     # an empty first page from an unknown key is a 404, not an empty list
     monkeypatch.setattr(api.fetch, "fetch_seller_reviews", lambda *a, **k: {"entries": []})
     monkeypatch.setattr(api.fetch, "fetch_seller_ads", lambda *a, **k: {"status": "incorrect-data"})

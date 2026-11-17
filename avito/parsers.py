@@ -27,12 +27,15 @@ raises ParseError only when the payload is not the page it claims to be.
 """
 import html as html_lib
 import json
+import fastjson
 import math
 import re
 from datetime import datetime, timedelta, timezone
 
 from avito import refs
 from scraper_errors import UpstreamError
+from scraper_utils.values import as_dict as _dict, as_list as _list
+from scraper_utils.text import clean as _clean
 
 
 class ParseError(UpstreamError):
@@ -57,16 +60,6 @@ MONTHS = {"января": 1, "февраля": 2, "марта": 3, "апреля
 
 # ---- small value helpers ------------------------------------------------------------------
 
-def _clean(value):
-    """Whitespace / nbsp / html entities normalised; empty -> None."""
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        value = str(value)
-    value = html_lib.unescape(value).replace(" ", " ").replace(" ", " ")
-    value = " ".join(value.split())
-    return value or None
-
 
 def _int(value):
     if value is None or isinstance(value, bool):
@@ -87,14 +80,6 @@ def _float(value):
         return float(str(value).replace(",", ".").replace(" ", ""))
     except (TypeError, ValueError):
         return None
-
-
-def _dict(value):
-    return value if isinstance(value, dict) else {}
-
-
-def _list(value):
-    return value if isinstance(value, list) else []
 
 
 def html_to_text(value):
@@ -259,21 +244,21 @@ def hydration_data(page):
     match = _HYDRATION_RE.search(page or "")
     if not match:
         return None
-    return json.loads(json.loads('"' + match.group(1) + '"'))
+    return fastjson.loads(fastjson.loads('"' + match.group(1) + '"'))
 
 
 def preloaded_state(page):
     match = _PRELOADED_RE.search(page or "")
     if not match:
         return None
-    return json.loads(json.loads('"' + match.group(1) + '"'))
+    return fastjson.loads(fastjson.loads('"' + match.group(1) + '"'))
 
 
 def mfe_state(page):
     match = _MFE_RE.search(page or "")
     if not match:
         return None
-    return json.loads(match.group(1))
+    return fastjson.loads(match.group(1))
 
 
 def is_challenge_page(page):
@@ -295,6 +280,7 @@ def _card_price(item):
     monthly = None
     has_discount_icon = False
     has_delivery = False
+    sale = {}
     for component, payload in _step_payloads(item.get("iva"), "PriceStep"):
         if component == "price":
             shown = _dict(payload.get("priceDetailed")) or shown
@@ -302,22 +288,36 @@ def _card_price(item):
             monthly = _int(payload.get("value"))
         elif component in ("discount-icon", "discount", "saleIcon"):
             has_discount_icon = True
+            if component == "discount":
+                # a sale: the card shows the sale price, priceDetailed keeps
+                # the pre-sale one ({"old_string": "52 000", "percent": 5})
+                sale = payload
         elif component == "delivery":
             has_delivery = True
     shown = shown or detailed
     amount = _int(shown.get("value")) if shown.get("value") not in (None, 0) or detailed.get("hasValue") else None
-    text = _clean(detailed.get("fullString")) or _clean(shown.get("string"))
+    full = detailed.get("fullString") or ""
+    shown_str, detailed_str = shown.get("string"), detailed.get("string")
+    if shown_str and detailed_str and shown_str != detailed_str:
+        # fullString spells priceDetailed; the text follows the shown price
+        full = full.replace(detailed_str, shown_str, 1) if detailed_str in full else f"{shown_str} ₽"
+    text = _clean(full) or _clean(shown.get("string"))
     if amount is None and not text:
         return None, has_delivery
     lowest = _int(detailed.get("value"))
+    # dealer cars: "от 5 950 000 ₽" printed, value = stringWithoutDiscount
+    # ("6 750 000 ₽ без скидки"), priceDetailed.value = the discounted price
+    has_discount = has_discount_icon or bool(shown.get("stringWithoutDiscount"))
+    old = (_int(item.get("priceWithoutDiscount")) or _int(shown.get("stringWithoutDiscount"))
+           or _int(sale.get("old_string")))
     price = {
         "amount": amount,
         "currency": refs.CURRENCY if amount is not None else None,
         "text": text,
         "unit": _clean(shown.get("postfix")) or _clean(detailed.get("postfix")),
-        "discounted_amount": lowest if (has_discount_icon and lowest and amount and lowest < amount) else None,
-        "old_amount": _int(item.get("priceWithoutDiscount")) or _int(shown.get("stringWithoutDiscount")),
-        "discount_percent": _int(item.get("discountPercent")),
+        "discounted_amount": lowest if (has_discount and lowest and amount and lowest < amount) else None,
+        "old_amount": old if old != amount else None,
+        "discount_percent": _int(item.get("discountPercent")) or _int(sale.get("percent")),
         "monthly_payment": monthly,
         "was_lowered": bool(shown.get("wasLowered") or detailed.get("wasLowered")),
     }
@@ -991,7 +991,9 @@ def parse_seller_page(page):
     if not key:
         return None
     widgets = _widgets(value)
-    base = widgets.get("base_info") or {}
+    # premium shops get the "ml" layout: base_info_ml carries the rating,
+    # "На Авито с …", badges and follower label; buttons stand in for contacts
+    base = widgets.get("base_info") or widgets.get("base_info_ml") or {}
     rating = _dict(base.get("rating"))
     subscribe = _dict(base.get("subscribeInfo"))
     contacts = widgets.get("contacts") or {}
@@ -1018,12 +1020,14 @@ def parse_seller_page(page):
     seo = _dict(loader.get("seoData")) or _dict(data.get("seo"))
     org = {}
     try:
-        graph = json.loads(seo.get("schemaOrg") or "{}").get("@graph") or []
+        graph = fastjson.loads(seo.get("schemaOrg") or "{}").get("@graph") or []
         org = _dict(graph[0]) if graph else {}
     except (ValueError, TypeError, AttributeError):
         org = {}
     address = _dict(org.get("address"))
     contact_types = [_dict(c).get("type") for c in _list(contacts.get("list"))]
+    contact_types += [{"messenger": "message", "call": "call", "phone": "call"}.get(k, k)
+                      for b in _list(_dict(base.get("buttons")).get("list")) for k in _dict(b)]
     custom = data.get("customLink")
     slug = None
     if custom:
@@ -1050,13 +1054,15 @@ def parse_seller_page(page):
             "verdict": (reviews["summary"] or {}).get("verdict"),
             "distribution": (reviews["summary"] or {}).get("distribution"),
         } if rating else None,
-        "subscribers_count": _int(_dict(subscribe.get("subscribers")).get("title")),
+        "subscribers_count": (_int(_dict(subscribe.get("subscribers")).get("title"))
+                              or _int(_dict(base.get("subscribers")).get("label"))),
         "subscriptions_count": _int(_dict(subscribe.get("subscriptions")).get("title")),
         "active_ads_count": tabs.get("active") if tabs.get("active") is not None else _int(catalog.get("totalCount")),
         "closed_ads_count": tabs.get("closed"),
         "categories": categories,
         "selections": selections,
-        "badges": _badge_titles(_dict(widgets.get("badgebar_v3")).get("badges")),
+        "badges": (_badge_titles(_dict(widgets.get("badgebar_v3")).get("badges"))
+                   or _badge_titles(_dict(base.get("badges")).get("values"))),
         "addresses": addresses or ([{"address": _clean(address.get("streetAddress")), "coordinates": None,
                                      "metro": []}] if _clean(address.get("streetAddress")) else []),
     }
